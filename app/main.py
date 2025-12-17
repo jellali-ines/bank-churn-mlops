@@ -100,7 +100,7 @@ def predict(features: CustomerFeatures):
         ]])
         
         # Prediction
-        proba = model.predict_proba(input_data)[0, 1]
+        proba = model.predict_proba(input_data)[0][1]
         prediction = int(proba > 0.5)
         
         # Classification du risque
@@ -148,7 +148,7 @@ def predict_batch(features_list: List[CustomerFeatures]):
                 features.Geography_Germany, features.Geography_Spain
             ]])
             
-            proba = model.predict_proba(input_data)[0, 1]
+            proba = model.predict_proba(input_data)[0][1]
             prediction = int(proba > 0.5)
             
             predictions.append({
