@@ -54,39 +54,49 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      # 🔹 Ensure Log Analytics Workspace exists
-      - name: Create/Validate Log Analytics Workspace
+      # 🔹 Attempt to create Log Analytics Workspace
+      - name: Attempt Log Analytics Workspace
         id: loganalytics
         run: |
           LAW_NAME="law-${{ github.actor }}-${RANDOM}"
+          echo "Attempting to create Log Analytics Workspace: $LAW_NAME"
+          set +e
           az monitor log-analytics workspace create \
             --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
             --name $LAW_NAME \
             --location ${{ env.LOCATION }} >/dev/null
+          RC=$?
+          set -e
 
-          LAW_ID=$(az monitor log-analytics workspace show \
-            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-            --workspace-name $LAW_NAME \
-            --query customerId -o tsv)
-
-          LAW_KEY=$(az monitor log-analytics workspace get-shared-keys \
-            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-            --workspace-name $LAW_NAME \
-            --query primarySharedKey -o tsv)
-
-          echo "LAW_ID=$LAW_ID" >> $GITHUB_ENV
-          echo "LAW_KEY=$LAW_KEY" >> $GITHUB_ENV
+          if [ $RC -ne 0 ]; then
+            echo "⚠️ Warning: Cannot create Log Analytics (insufficient permissions). Skipping..."
+            echo "LAW_ID=" >> $GITHUB_ENV
+            echo "LAW_KEY=" >> $GITHUB_ENV
+          else
+            LAW_ID=$(az monitor log-analytics workspace show \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --workspace-name $LAW_NAME \
+              --query customerId -o tsv)
+            LAW_KEY=$(az monitor log-analytics workspace get-shared-keys \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --workspace-name $LAW_NAME \
+              --query primarySharedKey -o tsv)
+            echo "LAW_ID=$LAW_ID" >> $GITHUB_ENV
+            echo "LAW_KEY=$LAW_KEY" >> $GITHUB_ENV
+            echo "✅ Log Analytics created successfully"
+          fi
 
       # 🔹 Ensure Container Apps Environment exists
       - name: Create/Validate Container Apps Environment
         run: |
-          if ! az containerapp env show -g ${{ env.AZURE_RESOURCE_GROUP }} -n ${{ env.CONTAINERAPPS_ENV }} >/dev/null 2>&1; then
-            az containerapp env create \
-              --name ${{ env.CONTAINERAPPS_ENV }} \
-              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-              --location ${{ env.LOCATION }} \
-              --logs-workspace-id $LAW_ID \
-              --logs-workspace-key $LAW_KEY >/dev/null
+          CMD="az containerapp env show -g ${{ env.AZURE_RESOURCE_GROUP }} -n ${{ env.CONTAINERAPPS_ENV }}"
+          if ! $CMD >/dev/null 2>&1; then
+            CREATE_CMD="az containerapp env create --name ${{ env.CONTAINERAPPS_ENV }} \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} --location ${{ env.LOCATION }}"
+            if [ ! -z "$LAW_ID" ]; then
+              CREATE_CMD="$CREATE_CMD --logs-workspace-id $LAW_ID --logs-workspace-key $LAW_KEY"
+            fi
+            $CREATE_CMD >/dev/null
           fi
 
       # 🔑 Login to ACR
@@ -108,22 +118,16 @@ jobs:
         run: |
           IMAGE_TAG=${GITHUB_SHA}
           if az containerapp show -g ${{ env.AZURE_RESOURCE_GROUP }} -n ${{ env.CONTAINER_APP_NAME }} >/dev/null 2>&1; then
-            echo "Updating existing Container App..."
             az containerapp update \
               --name ${{ env.CONTAINER_APP_NAME }} \
               --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
               --image ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:$IMAGE_TAG
           else
-            echo "Creating new Container App..."
-            az containerapp create \
-              --name ${{ env.CONTAINER_APP_NAME }} \
-              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-              --environment ${{ env.CONTAINERAPPS_ENV }} \
+            CREATE_CMD="az containerapp create --name ${{ env.CONTAINER_APP_NAME }} \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} --environment ${{ env.CONTAINERAPPS_ENV }} \
               --image ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:$IMAGE_TAG \
-              --ingress external \
-              --target-port ${{ env.TARGET_PORT }} \
-              --min-replicas 1 \
-              --max-replicas 1
+              --ingress external --target-port ${{ env.TARGET_PORT }} --min-replicas 1 --max-replicas 1"
+            $CREATE_CMD
           fi
 
       # ✅ Verify deployment
@@ -133,9 +137,7 @@ jobs:
             --name ${{ env.CONTAINER_APP_NAME }} \
             --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
             --query properties.configuration.ingress.fqdn -o tsv)
-
           echo "Application deployed at: https://$APP_URL"
-
           for i in {1..10}; do
             if curl -f https://$APP_URL/health; then
               echo "Health check passed!"
@@ -145,3 +147,18 @@ jobs:
               sleep 10
             fi
           done
+
+      # 🔔 Notify Slack
+      - name: Notify Slack on Success
+        if: success()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          APP_URL=$(az containerapp show \
+            --name ${{ env.CONTAINER_APP_NAME }} \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --query properties.configuration.ingress.fqdn -o tsv)
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{
+              \"text\": \"✅ CI/CD Pipeline succeeded!\nApplication is live at: https://$APP_URL\"
+            }" $SLACK_WEBHOOK_URL
