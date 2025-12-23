@@ -9,12 +9,9 @@ on:
 
 env:
   AZURE_RESOURCE_GROUP: rg-mlops-bank-churn4
-  LOCATION: italynorth
   ACR_NAME: mlopsines
   CONTAINER_APP_NAME: bank-churn
   IMAGE_NAME: churn-api
-  TARGET_PORT: 8000
-  CONTAINERAPPS_ENV: env-mlops-workshop
 
 jobs:
   test:
@@ -28,6 +25,14 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
+      
+      - name: Cache pip packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
       
       - name: Install dependencies
         run: |
@@ -43,53 +48,45 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
-
+    
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
-
-      # 🔑 Login Azure via Service Principal
+      
       - name: Azure Login
         uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
-
-      # 🔹 Ensure Container Apps Environment exists (no Log Analytics)
-      - name: Validate Container Apps Environment
-        run: |
-          if ! az containerapp env show -g ${{ env.AZURE_RESOURCE_GROUP }} -n ${{ env.CONTAINERAPPS_ENV }} >/dev/null 2>&1; then
-            echo "❌ Environment ${{ env.CONTAINERAPPS_ENV }} does not exist. Please create it manually first."
-            exit 1
-          fi
-
-      # 🔑 Login to ACR
-      - name: Login to Azure Container Registry
-        run: |
-          az acr login --name ${{ env.ACR_NAME }}
-
-      # 🐳 Build and push Docker image
+      
+      - name: Login to ACR
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ env.ACR_NAME }}.azurecr.io
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+      
       - name: Build and push Docker image
         run: |
-          IMAGE_TAG=${GITHUB_SHA}
-          docker build -t ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:$IMAGE_TAG .
-          docker tag ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:$IMAGE_TAG ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:latest
-          docker push ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:$IMAGE_TAG
+          echo "🔨 Building Docker image..."
+          docker build -t ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }} .
+          docker tag ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }} ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:latest
+          
+          echo "🚀 Pushing Docker image..."
+          docker push ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}
           docker push ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:latest
-
-      # 🚀 Deploy to Azure Container Apps
+          
+          echo "✅ Docker image pushed successfully"
+      
       - name: Deploy to Azure Container Apps
-        run: |
-          IMAGE_TAG=${GITHUB_SHA}
-          if az containerapp show -g ${{ env.AZURE_RESOURCE_GROUP }} -n ${{ env.CONTAINER_APP_NAME }} >/dev/null 2>&1; then
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            echo "⚡ Updating Container App..."
             az containerapp update \
               --name ${{ env.CONTAINER_APP_NAME }} \
               --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-              --image ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:$IMAGE_TAG
-          else
-            echo "❌ Container App ${{ env.CONTAINER_APP_NAME }} does not exist. Please create it manually first."
-            exit 1
-
-      # ✅ Verify deployment
+              --image ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}
+      
       - name: Verify deployment
         run: |
           APP_URL=$(az containerapp show \
@@ -97,27 +94,7 @@ jobs:
             --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
             --query properties.configuration.ingress.fqdn -o tsv)
           echo "Application deployed at: https://$APP_URL"
-          for i in {1..10}; do
-            if curl -f https://$APP_URL/health; then
-              echo "Health check passed!"
-              break
-            else
-              echo "Waiting for Container App to start..."
-              sleep 10
-            fi
-          done
-
-      # 🔔 Notify Slack
-      - name: Notify Slack on Success
-        if: success()
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        run: |
-          APP_URL=$(az containerapp show \
-            --name ${{ env.CONTAINER_APP_NAME }} \
-            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-            --query properties.configuration.ingress.fqdn -o tsv)
-          curl -X POST -H 'Content-type: application/json' \
-            --data "{
-              \"text\": \"✅ CI/CD Pipeline succeeded!\nApplication is live at: https://$APP_URL\"
-            }" $SLACK_WEBHOOK_URL
+          echo "Waiting 10 seconds before health check..."
+          sleep 10
+          curl -k -f https://$APP_URL/health || { echo "❌ Health check failed!"; exit 1; }
+          echo "✅ Deployment successful!"
